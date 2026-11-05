@@ -1,0 +1,310 @@
+# Runs openperouter's grout lanes (kind "grout" and "qemu-grout") from the
+# latest openperouter main, with the grout RPMs built by one grout push.
+#
+# The job steps mirror openperouter's .github/workflows/ci.yaml; when that file
+# changes significantly, these may need updating.
+name: grout e2e
+# poll.sh matches on the SHA in the run name to skip already tested pushes.
+run-name: "grout e2e @ ${{ inputs.grout_sha }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      grout_run_id:
+        description: "DPDK/grout Publish workflow run ID providing the RPMs"
+        required: true
+      grout_sha:
+        description: "grout commit SHA of that run"
+        required: true
+      grout_base_sha:
+        description: "Previous tested grout SHA (for the compare link)"
+        required: false
+        default: ""
+      openperouter_ref:
+        description: "openperouter ref to test"
+        required: false
+        default: main
+
+permissions:
+  contents: read
+
+env:
+  OPENPEROUTER_REPO: openperouter/openperouter
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      openperouter-sha: ${{ steps.sha.outputs.sha }}
+    steps:
+      # Pin one openperouter commit for all jobs, even if main moves meanwhile.
+      - name: Resolve openperouter ref
+        id: sha
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF: ${{ inputs.openperouter_ref }}
+        run: |
+          sha=$(gh api "repos/${OPENPEROUTER_REPO}/commits/${REF}" --jq .sha)
+          echo "openperouter ${REF} -> ${sha}"
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+
+  build-kind-node-image:
+    runs-on: ubuntu-26.04
+    needs: prepare
+    outputs:
+      kind-node-version: ${{ steps.build.outputs.kind-node-version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.OPENPEROUTER_REPO }}
+          ref: ${{ needs.prepare.outputs.openperouter-sha }}
+          persist-credentials: false
+      - name: Build kind-node-openperouter image
+        id: build
+        uses: ./.github/workflows/composite/build-kind-node-image
+
+  build-grout-image:
+    runs-on: ubuntu-26.04
+    needs: prepare
+    steps:
+      - name: Checkout openperouter
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.OPENPEROUTER_REPO }}
+          ref: ${{ needs.prepare.outputs.openperouter-sha }}
+          persist-credentials: false
+      - name: Checkout CI scripts
+        uses: actions/checkout@v7
+        with:
+          path: _grout-ci
+          persist-credentials: false
+
+      - name: Download grout RPMs
+        uses: actions/download-artifact@v8
+        with:
+          name: rpm-x86_64-packages
+          repository: DPDK/grout
+          run-id: ${{ inputs.grout_run_id }}
+          # Cross-repo artifact download. Set GROUT_ARTIFACTS_TOKEN (a PAT,
+          # public repo read access is enough) if github.token is refused.
+          github-token: ${{ secrets.GROUT_ARTIFACTS_TOKEN || github.token }}
+          path: ${{ runner.temp }}/grout-rpms
+
+      - name: Patch Dockerfile.grout to use the downloaded RPMs
+        run: |
+          python3 -I _grout-ci/hack/patch-dockerfile.py \
+            --context . --dockerfile Dockerfile.grout --rpms "$RUNNER_TEMP/grout-rpms"
+          rm -rf _grout-ci
+
+      - name: Setup docker buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and export the image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          tags: quay.io/openperouter/router:main-grout,localhost:5000/router:main-grout
+          file: Dockerfile.grout
+          outputs: type=docker,dest=/tmp/openperouter-grout.tar
+          cache-from: type=gha,scope=openperouter-grout
+          cache-to: type=gha,mode=max,scope=openperouter-grout
+
+      - name: Check the image ships the grout under test
+        env:
+          GROUT_SHA: ${{ inputs.grout_sha }}
+        run: |
+          docker load -i /tmp/openperouter-grout.tar
+          docker run --rm --entrypoint rpm quay.io/openperouter/router:main-grout -q grout grout-frr frr
+          # grout's RPM release embeds the git hash, e.g. 0.20.0-0.g5d267740.el10
+          release=$(docker run --rm --entrypoint rpm quay.io/openperouter/router:main-grout -q --qf '%{RELEASE}' grout)
+          if [[ "$release" != *".g${GROUT_SHA:0:8}"* ]]; then
+            echo "ERROR: image has grout release ${release}, expected commit ${GROUT_SHA:0:8}"
+            exit 1
+          fi
+
+      - name: Upload openperouter-grout image
+        uses: actions/upload-artifact@v7
+        with:
+          retention-days: 1
+          name: image-tar-openperouter-grout
+          path: /tmp/openperouter-grout.tar
+
+  e2e-kind-grout:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 240
+    needs: [prepare, build-kind-node-image, build-grout-image]
+    env:
+      NODE_IMAGE: quay.io/openperouter/kind-node-openperouter:${{ needs.build-kind-node-image.outputs.kind-node-version }}
+    steps:
+      - name: Free Disk Space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
+          sudo apt-get clean
+          df -h
+
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.OPENPEROUTER_REPO }}
+          ref: ${{ needs.prepare.outputs.openperouter-sha }}
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: "go.mod"
+          cache: true
+
+      - name: Install kernel modules
+        run: hack/install-kernel-modules.sh
+
+      - name: Log martians
+        run: sudo sysctl -w net.ipv4.conf.default.log_martians=1
+
+      - name: Increase inotify limits
+        run: |
+          sudo sysctl -w fs.inotify.max_user_watches=524288
+          sudo sysctl -w fs.inotify.max_user_instances=512
+
+      - name: Disable containerd image store
+        run: |
+          echo '{"features": {"containerd-snapshotter": false}}' | sudo tee /etc/docker/daemon.json
+          sudo systemctl restart docker
+          docker info -f '{{ .DriverStatus }}'
+
+      - name: Load kind-node-openperouter image
+        uses: ./.github/workflows/composite/load-kind-node-image
+
+      - name: Download openperouter-grout image
+        uses: actions/download-artifact@v8
+        with:
+          name: image-tar-openperouter-grout
+          path: image
+
+      - name: Load image
+        run: docker load -i image/openperouter-grout.tar
+
+      - name: Deploy the cluster
+        run: |
+          bash hack/capture-kind-boot-logs.sh /tmp/kind_logs &
+          BOOT_LOG_PID=$!
+          trap 'kill "$BOOT_LOG_PID" 2>/dev/null || true; wait "$BOOT_LOG_PID" || true' EXIT
+          COREDUMP=true IMG_REPO=quay.io/openperouter make grout-deploy
+
+      - name: Run e2e tests
+        run: make e2etests GINKGO_ARGS="--label-filter='grout-support || grout-only'" TEST_ARGS="--groutmode"
+
+      - name: Upload e2e test reports
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          retention-days: 14
+          name: e2e-reports-grout
+          path: /tmp/kind_logs/e2e-report*.json
+          if-no-files-found: ignore
+
+      - name: Export kind logs
+        if: ${{ failure() }}
+        run: make kind-export-logs
+
+      - name: Collect dmesg and veth monitor logs
+        if: ${{ failure() }}
+        run: |
+          sudo dmesg -T > /tmp/kind_logs/dmesg.log
+          cp /tmp/check_veths.log /tmp/kind_logs/check_veths.log 2>/dev/null || true
+
+      - name: Collect Logs
+        if: ${{ failure() }}
+        uses: ./.github/workflows/composite/collectlogs
+        with:
+          artifact-name: kind-logs-grout
+
+  e2e-qemu-grout:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 240
+    needs: [prepare, build-grout-image]
+    steps:
+      - name: Free Disk Space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
+          sudo apt-get clean
+          df -h
+
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.OPENPEROUTER_REPO }}
+          ref: ${{ needs.prepare.outputs.openperouter-sha }}
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: "go.mod"
+          cache: true
+
+      - name: Install kernel modules
+        run: hack/install-kernel-modules.sh
+
+      - name: Install QEMU and dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 qemu-utils genisoimage sshpass
+
+      - name: Verify KVM support
+        run: |
+          if [ ! -e /dev/kvm ]; then
+            echo "ERROR: /dev/kvm not available. KVM support is required."
+            exit 1
+          fi
+          sudo chmod 666 /dev/kvm
+
+      - name: Download openperouter-grout image
+        uses: actions/download-artifact@v8
+        with:
+          name: image-tar-openperouter-grout
+          path: image
+
+      - name: Load openperouter image
+        run: docker load -i image/openperouter-grout.tar
+
+      - name: Deploy the QEMU cluster
+        run: KUSTOMIZE_LAYER=grout make qemu-deploy IMG_TAG=main-grout
+
+      - name: Run QEMU e2e tests
+        run: make qemu-e2etests
+
+      - name: Upload QEMU logs
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v7
+        with:
+          retention-days: 14
+          name: qemu-e2e-logs
+          path: /tmp/kind_logs/
+
+      - name: Cleanup
+        if: always()
+        run: make qemu-clean clean
+
+  report:
+    runs-on: ubuntu-latest
+    needs: [prepare, build-kind-node-image, build-grout-image, e2e-kind-grout, e2e-qemu-grout]
+    # Skip on cancellation: a cancelled run says nothing about grout.
+    if: ${{ always() && !cancelled() }}
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Open, update or close the regression issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESULT: ${{ contains(needs.*.result, 'failure') && 'failure' || 'success' }}
+          GROUT_SHA: ${{ inputs.grout_sha }}
+          GROUT_BASE_SHA: ${{ inputs.grout_base_sha }}
+          GROUT_RUN_ID: ${{ inputs.grout_run_id }}
+          OPENPEROUTER_SHA: ${{ needs.prepare.outputs.openperouter-sha }}
+          JOB_RESULTS: |
+            build-kind-node-image: ${{ needs.build-kind-node-image.result }}
+            build-grout-image:     ${{ needs.build-grout-image.result }}
+            e2e-kind-grout:        ${{ needs.e2e-kind-grout.result }}
+            e2e-qemu-grout:        ${{ needs.e2e-qemu-grout.result }}
+        run: hack/report.sh

@@ -1,0 +1,36 @@
+name: Poll grout
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      max_dispatch:
+        description: "Max e2e runs to dispatch"
+        default: "3"
+      dry_run:
+        description: "Only print what would be dispatched"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: write # dispatch grout-e2e.yml
+
+concurrency:
+  group: poll-grout
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Dispatch e2e runs for untested grout pushes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MAX_DISPATCH: ${{ inputs.max_dispatch || '3' }}
+          DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
+        run: hack/poll.sh
